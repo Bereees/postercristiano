@@ -4,7 +4,55 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Poster — Hello World</title>
-    <link rel="stylesheet" href="styles.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body {
+            height: 100%;
+            overflow: hidden;
+            background: #0a0a0a;
+            font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        }
+        #stage {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .poster-wrap {
+            position: relative;
+            width: min(100vw, calc(100vh * (423 / 532)));
+            height: min(100vh, calc(100vw * (532 / 423)));
+        }
+        .poster-wrap svg {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        #hello-group { pointer-events: none; }
+        #world { pointer-events: all; }
+        .letter-drag { cursor: grab; touch-action: none; }
+        .letter-drag.is-dragging { cursor: grabbing; }
+        .letter-drag path { pointer-events: all; }
+        #play {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: none;
+            background: rgba(0, 0, 0, 0.35);
+            color: #fff;
+            font-size: clamp(1rem, 2.5vw, 1.35rem);
+            letter-spacing: 0.04em;
+            cursor: pointer;
+            transition: background 0.35s ease, opacity 0.35s ease;
+            z-index: 10;
+        }
+        #play:hover { background: rgba(0, 0, 0, 0.45); }
+        #play.is-hidden { opacity: 0; pointer-events: none; }
+    </style>
 </head>
 <body>
     <main id="stage">
@@ -43,8 +91,296 @@
         </div>
         <button id="play" type="button">Tocca per iniziare</button>
     </main>
-    <script src="https://cdn.jsdelivr.net/npm/animejs@4.2.2/dist/bundles/anime.umd.min.js" defer></script>
-    <script src="audio.js" defer></script>
-    <script src="main.js" defer></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/animejs@4.2.2/dist/bundles/anime.umd.min.js"></script>
+    <script>
+    (function () {
+        var ctx = null;
+        function getCtx() {
+            if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+            return ctx;
+        }
+        function tone(o) {
+            o = o || {};
+            var ac = getCtx(), t0 = ac.currentTime + (o.when || 0);
+            var osc = ac.createOscillator(), amp = ac.createGain();
+            osc.type = o.type || "sine";
+            osc.frequency.setValueAtTime(o.freq || 440, t0);
+            amp.gain.setValueAtTime(0, t0);
+            amp.gain.linearRampToValueAtTime(o.gain || 0.06, t0 + 0.01);
+            amp.gain.exponentialRampToValueAtTime(0.0001, t0 + (o.duration || 0.08));
+            osc.connect(amp); amp.connect(ac.destination);
+            osc.start(t0); osc.stop(t0 + (o.duration || 0.08) + 0.02);
+        }
+        function noiseBurst(o) {
+            o = o || {};
+            var ac = getCtx(), t0 = ac.currentTime + (o.when || 0);
+            var dur = o.duration || 0.12;
+            var buf = ac.createBuffer(1, Math.floor(ac.sampleRate * dur), ac.sampleRate);
+            var data = buf.getChannelData(0), i;
+            for (i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+            var src = ac.createBufferSource(), amp = ac.createGain(), f = ac.createBiquadFilter();
+            src.buffer = buf; f.type = "bandpass"; f.frequency.value = 1200; f.Q.value = 0.6;
+            amp.gain.setValueAtTime(o.gain || 0.04, t0);
+            amp.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+            src.connect(f); f.connect(amp); amp.connect(ac.destination);
+            src.start(t0); src.stop(t0 + dur);
+        }
+        window.PosterAudio = {
+            resume: function () { var ac = getCtx(); if (ac.state === "suspended") ac.resume(); },
+            playStart: function () { tone({ freq: 520, duration: 0.06, gain: 0.05 }); },
+            playSun: function () {
+                tone({ freq: 180, duration: 0.15, type: "triangle", gain: 0.04 });
+                tone({ freq: 260, duration: 1.8, type: "sine", gain: 0.025, when: 0.05 });
+            },
+            playDraw: function () { noiseBurst({ duration: 0.09, gain: 0.035 }); },
+            playSnap: function () {
+                tone({ freq: 340, duration: 0.1, type: "triangle", gain: 0.05 });
+                tone({ freq: 220, duration: 0.14, type: "sine", gain: 0.03, when: 0.04 });
+            }
+        };
+    })();
+    </script>
+    <script>
+    (function () {
+        var animeLib = window.anime || {};
+        var animate = animeLib.animate;
+        var createDrawable = animeLib.createDrawable;
+        var spring = animeLib.spring;
+
+        var playBtn = document.getElementById("play");
+        var poster = document.getElementById("poster");
+        var audio = window.PosterAudio;
+        var SVG_NS = "http://www.w3.org/2000/svg";
+        var WORLD_IDS = ["w", "o", "r", "l", "d"];
+        var HELLO_SLIDE_FROM = -220;
+
+        var started = false;
+        var sunSlowLoop = null;
+        var worldWraps = new Map();
+
+        function showError(message) {
+            var el = document.getElementById("load-error");
+            if (!el) {
+                el = document.createElement("p");
+                el.id = "load-error";
+                el.style.cssText = "position:fixed;bottom:1rem;left:1rem;right:1rem;padding:1rem;background:#300;color:#fff;font:14px/1.4 system-ui,sans-serif;z-index:99;";
+                document.body.appendChild(el);
+            }
+            el.textContent = message;
+        }
+
+        if (!animate || !createDrawable) {
+            showError("Anime.js non caricato. Serve connessione internet, poi ricarica.");
+            return;
+        }
+
+        function animDone(targets, params) {
+            return new Promise(function (resolve) {
+                var p = Object.assign({}, params, { onComplete: resolve });
+                animate(targets, p);
+            });
+        }
+
+        function setupSunPivot() {
+            var sunPath = document.getElementById("sun");
+            var parent = sunPath.parentNode;
+            var bbox = sunPath.getBBox();
+            var cx = bbox.x + bbox.width / 2;
+            var cy = bbox.y + bbox.height / 2;
+            var pivot = document.createElementNS(SVG_NS, "g");
+            pivot.id = "sun-pivot";
+            var inner = document.createElementNS(SVG_NS, "g");
+            inner.setAttribute("transform", "translate(" + (-cx) + " " + (-cy) + ")");
+            pivot.setAttribute("transform", "translate(" + cx + " " + cy + ")");
+            parent.insertBefore(pivot, sunPath);
+            pivot.appendChild(inner);
+            inner.appendChild(sunPath);
+        }
+
+        function setupHelloPaths() {
+            var group = document.getElementById("hello-group");
+            setWrapTranslate(group, HELLO_SLIDE_FROM, 0);
+            var drawWhite = createDrawable("#hello-white")[0];
+            var drawBlue = createDrawable("#hello-blue")[0];
+            drawWhite.draw = "0 0";
+            drawBlue.draw = "0 0";
+        }
+
+        function setWrapTranslate(wrap, x, y) {
+            wrap.setAttribute("transform", "translate(" + x + " " + y + ")");
+            wrap._tx = x;
+            wrap._ty = y;
+        }
+
+        function getWrapTranslate(wrap) {
+            return { x: wrap._tx || 0, y: wrap._ty || 0 };
+        }
+
+        function clientToSvg(svg, clientX, clientY) {
+            var pt = svg.createSVGPoint();
+            pt.x = clientX;
+            pt.y = clientY;
+            var ctm = svg.getScreenCTM();
+            if (!ctm) return { x: 0, y: 0 };
+            return pt.matrixTransform(ctm.inverse());
+        }
+
+        function startSunSlowLoop() {
+            if (sunSlowLoop) sunSlowLoop.pause();
+            sunSlowLoop = animate("#sun-pivot", {
+                rotate: "+=360",
+                duration: 14000,
+                ease: "linear",
+                loop: true
+            });
+        }
+
+        function animateSun() {
+            audio.playSun();
+            return animDone("#sun-pivot", {
+                rotate: 360,
+                duration: 2600,
+                ease: "out(3)"
+            }).then(startSunSlowLoop);
+        }
+
+        function animateHello() {
+            var group = document.getElementById("hello-group");
+            var drawWhite = createDrawable("#hello-white")[0];
+            var drawBlue = createDrawable("#hello-blue")[0];
+            drawWhite.draw = "0 0";
+            drawBlue.draw = "0 0";
+            audio.playDraw();
+
+            var slide = { t: 0 };
+            return animDone(slide, {
+                t: 1,
+                duration: 2200,
+                ease: "out(3)",
+                onUpdate: function () {
+                    var x = HELLO_SLIDE_FROM + -HELLO_SLIDE_FROM * slide.t;
+                    setWrapTranslate(group, x, 0);
+                },
+                onComplete: function () { setWrapTranslate(group, 0, 0); }
+            }).then(function () {
+                return animDone(drawWhite, {
+                    draw: ["0 0", "0 1"],
+                    duration: 2000,
+                    ease: "inOutSine"
+                });
+            }).then(function () {
+                audio.playDraw();
+                return animDone(drawBlue, {
+                    draw: ["0 0", "0 1"],
+                    duration: 2000,
+                    ease: "inOutSine"
+                });
+            });
+        }
+
+        function wrapWorldLetter(path) {
+            var wrap = document.createElementNS(SVG_NS, "g");
+            wrap.classList.add("letter-drag");
+            wrap.dataset.letter = path.id;
+            path.parentNode.insertBefore(wrap, path);
+            wrap.appendChild(path);
+            setWrapTranslate(wrap, 0, 0);
+            worldWraps.set(path.id, wrap);
+            return wrap;
+        }
+
+        function snapWorldLetter(wrap) {
+            var pos = getWrapTranslate(wrap);
+            if (!pos.x && !pos.y) return;
+            audio.playSnap();
+            var proxy = { t: 0 };
+            animate(proxy, {
+                t: 1,
+                duration: 480,
+                ease: spring ? spring({ bounce: 0.12, duration: 480 }) : "out(3)",
+                onUpdate: function () {
+                    setWrapTranslate(wrap, pos.x * (1 - proxy.t), pos.y * (1 - proxy.t));
+                },
+                onComplete: function () { setWrapTranslate(wrap, 0, 0); }
+            });
+        }
+
+        function bindWorldDrag(wrap) {
+            if (wrap.dataset.dragReady) return;
+            wrap.dataset.dragReady = "1";
+            var drag = null;
+
+            wrap.addEventListener("pointerdown", function (e) {
+                if (e.button !== 0) return;
+                drag = {
+                    pointerId: e.pointerId,
+                    start: clientToSvg(poster, e.clientX, e.clientY),
+                    origin: getWrapTranslate(wrap)
+                };
+                wrap.setPointerCapture(e.pointerId);
+                wrap.classList.add("is-dragging");
+                e.preventDefault();
+                e.stopPropagation();
+            });
+
+            wrap.addEventListener("pointermove", function (e) {
+                if (!drag || e.pointerId !== drag.pointerId) return;
+                var pt = clientToSvg(poster, e.clientX, e.clientY);
+                setWrapTranslate(
+                    wrap,
+                    drag.origin.x + pt.x - drag.start.x,
+                    drag.origin.y + pt.y - drag.start.y
+                );
+            });
+
+            function endDrag(e) {
+                if (!drag || e.pointerId !== drag.pointerId) return;
+                drag = null;
+                wrap.classList.remove("is-dragging");
+                try { wrap.releasePointerCapture(e.pointerId); } catch (err) {}
+                snapWorldLetter(wrap);
+            }
+
+            wrap.addEventListener("pointerup", endDrag);
+            wrap.addEventListener("pointercancel", endDrag);
+        }
+
+        function setupWorldDrag() {
+            worldWraps.forEach(function (wrap) { bindWorldDrag(wrap); });
+            document.body.classList.add("is-ready");
+        }
+
+        function runIntro() {
+            return animateSun().then(animateHello).catch(function (err) {
+                console.error(err);
+                showError("Errore animazione: " + err.message);
+            });
+        }
+
+        function onStart() {
+            if (started) return;
+            started = true;
+            audio.resume();
+            audio.playStart();
+            playBtn.classList.add("is-hidden");
+            runIntro();
+        }
+
+        try {
+            setupSunPivot();
+            setupHelloPaths();
+            WORLD_IDS.forEach(function (id) {
+                var path = document.getElementById(id);
+                if (path) wrapWorldLetter(path);
+            });
+            setupWorldDrag();
+            playBtn.addEventListener("click", onStart);
+        } catch (err) {
+            console.error(err);
+            showError("Errore avvio: " + err.message);
+        }
+    })();
+    </script>
 </body>
 </html>
